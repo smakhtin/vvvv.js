@@ -28,6 +28,8 @@ VVVV.Core = {
     this.changed = true;
     this.active = false;
     this.reset_on_disconnect = reset_on_disconnect || false;
+    this.slavePin = undefined;
+    this.masterPin = undefined;
     
     this.getValue = function(i, binSize) {
       if (!binSize || binSize==1)
@@ -43,23 +45,35 @@ VVVV.Core = {
       this.values[i] = v;
       this.changed = true;
       this.node.dirty = true;
-      _(this.links).each(function(l) {
-        l.toPin.values[i] = v;
-        l.toPin.changed = true;
-        l.toPin.node.dirty = true;
-      });
-      if (this.node.isIOBox && this.pinname=='Descriptive Name' && this.node.patch.domInterface) {
-        this.node.patch.domInterface.connect(this.node);
+      var that = this;
+      var linkCount = this.links.length;
+      for (var j=0; j<linkCount; j++) {
+        if (this.links[j].toPin==that) break;
+        this.links[j].toPin.setValue(i, v);
+      }
+      if (this.slavePin) {
+        this.slavePin.setValue(i, v);
+      }
+      if (this.node.isIOBox && this.pinname=='Descriptive Name') {
+        if (this.node.parentPatch.domInterface)
+          this.node.parentPatch.domInterface.connect(this.node);
+        else if (this.node.parentPatch.parentPatch)
+          this.node.registerInterfacePin();
       }
     }
     
     this.markPinAsChanged = function() {
       this.changed = true;
       this.node.dirty = true;
-      _(this.links).each(function(l) {
-        l.toPin.changed = true;
-        l.toPin.node.dirty = true;
-      });
+      var that = this;
+      var linkCount = this.links.length;
+      for (var i=0; i<linkCount; i++) {
+        if (this.links[i].toPin==that) break;
+        this.links[i].toPin.markPinAsChanged();
+      }
+      if (this.slavePin) {
+        this.slavePin.markPinAsChanged();
+      }
     }
     
     this.pinIsChanged = function() {
@@ -69,7 +83,7 @@ VVVV.Core = {
     }
 	
     this.isConnected = function() {
-      return this.links.length > 0 ? true : false;
+      return (this.links.length > 0 || (this.masterPin && this.masterPin.isConnected()));
     }
     
     this.getSliceCount = function() {
@@ -82,11 +96,15 @@ VVVV.Core = {
       this.values.length = len;
       this.changed = true;	  
       this.node.dirty = true; 
-	   _(this.links).each(function(l) {
-        l.toPin.values.length = len;
-        l.toPin.changed = true;
-        l.toPin.node.dirty = true;
-      });
+	    var linkCount = this.links.length;
+      for (var i=0; i<linkCount; i++) {
+        this.links[i].toPin.values.length = len;
+        this.links[i].toPin.changed = true;
+        this.links[i].toPin.node.dirty = true;
+      }
+      if (this.slavePin) {
+        this.slavePin.setSliceCount(len);
+      }
     }
     
     this.reset = function() {
@@ -99,7 +117,7 @@ VVVV.Core = {
     }
   },
   
-  Node: function(id, nodename, patch) {
+  Node: function(id, nodename, parentPatch) {
   
     this.nodename = nodename;
     this.id = id;
@@ -110,20 +128,23 @@ VVVV.Core = {
     this.isIOBox = false;
     this.isShader = false;
     
-    this.inputPins = {};
-    this.outputPins = {};
-    this.invisiblePins = {} ;
+    this.setupObject = function() { // had to put this into a method to allow Patch to "derive" from Node. Really have to understand this javascript prototype thing some day ...
+      this.inputPins = {};
+      this.outputPins = {};
+      this.invisiblePins = {} ;
 	
-	  this.defaultPinValues = {};
+	    this.defaultPinValues = {};
+	  };
+	  this.setupObject();
     
     this.auto_evaluate = false;
     this.delays_output = false;
     
     this.dirty = true;
     
-    this.patch = patch;
-    if (patch)
-      this.patch.nodeMap[id] = this;
+    this.parentPatch = parentPatch;
+    if (parentPatch)
+      this.parentPatch.nodeMap[id] = this;
 	  
     this.addDefault = function(pinname, value) {
       this.defaultPinValues[pinname] = value;
@@ -132,7 +153,8 @@ VVVV.Core = {
     this.addInputPin = function(pinname, value, _reserved, reset_on_disconnect) {
       pin = new VVVV.Core.Pin(pinname,PinDirection.Input, value, this, reset_on_disconnect);
       this.inputPins[pinname] = pin;
-      this.patch.pinMap[this.id+'_'+pinname] = pin;
+      if (this.parentPatch)
+        this.parentPatch.pinMap[this.id+'_'+pinname] = pin;
       this.applyPinValuesFromXML(pinname);
       return pin;
     }
@@ -140,14 +162,15 @@ VVVV.Core = {
     this.addOutputPin = function(pinname, value) {
       pin = new VVVV.Core.Pin(pinname,PinDirection.Output, value, this);
       this.outputPins[pinname] = pin;
-      this.patch.pinMap[this.id+'_'+pinname] = pin;
+      if (this.parentPatch)
+        this.parentPatch.pinMap[this.id+'_'+pinname] = pin;
       return pin;
     }
     
     this.addInvisiblePin = function(pinname, value) {
       pin = new VVVV.Core.Pin(pinname,PinDirection.Configuration, value, this);
       this.invisiblePins[pinname] = pin;
-      this.patch.pinMap[this.id+'_'+pinname] = pin;
+      this.parentPatch.pinMap[this.id+'_'+pinname] = pin;
       if (this.defaultPinValues[pinname] != undefined) {
         pin.values = this.defaultPinValues[pinname];
       }
@@ -289,6 +312,61 @@ VVVV.Core = {
         }
       }
     }
+    
+    this.registerInterfacePin = function() {
+      var that = this;
+      if (this.isIOBox) {
+        if (this.parentPatch.parentPatch && this.invisiblePins["Descriptive Name"].getValue(0)!="") {
+          var pinname = this.invisiblePins["Descriptive Name"].getValue(0);
+          this.IOBoxInputPin().connectionChanged = function() {
+            if (this.links.length==0) // TODO: delete subpatch pin
+              return;
+            if (true) { //}!that.IOBoxOutputPin().slavePin) {
+              if (VVVV_ENV=='development') console.log('interfacing output pin detected: '+pinname);
+              var pin = that.parentPatch.outputPins[pinname];
+              if (pin==undefined)
+                var pin = that.parentPatch.addOutputPin(pinname, that.IOBoxOutputPin().values);
+              that.IOBoxOutputPin().slavePin = pin;
+              pin.masterPin = that.IOBoxOutputPin();
+            }
+            else if (that.IOBoxOutputPin().slavePin.pinname!=pinname) { // rename subpatch pin
+              console.log('renaming '+that.IOBoxOutputPin().slavePin.pinname+" to "+pinname);
+              that.parentPatch.outputPins[pinname] = that.parentPatch.outputPins[that.IOBoxOutputPin().slavePin.pinname];
+              delete that.parentPatch.outputPins[that.IOBoxOutputPin().slavePin.pinname];
+              that.IOBoxOutputPin().slavePin.pinname = pinname;
+            }
+          }
+          this.IOBoxInputPin().connectionChanged();
+          
+          this.IOBoxOutputPin().connectionChanged = function() {
+            if (this.links.length==0) // TODO: delete subpatch pin
+              return;
+            if (VVVV_ENV=='development') console.log('interfacing input pin detected: '+pinname);
+            if (!that.IOBoxInputPin().masterPin) {
+              var pin = that.parentPatch.inputPins[pinname];
+              if (pin==undefined)
+                var pin = that.parentPatch.addInputPin(pinname, that.IOBoxInputPin().values, null, false);
+              else {
+                slicecount = pin.getSliceCount();
+                for (var i=0; i<slicecount; i++) {
+                  that.IOBoxInputPin().setValue(i, pin.getValue(i));
+                }
+                that.IOBoxInputPin().setSliceCount(pin.getSliceCount());
+              }
+              pin.slavePin = that.IOBoxInputPin();
+              that.IOBoxInputPin().masterPin = pin;
+            }
+            else if (that.IOBoxInputPin().masterPin.pinname!=pinname) { // rename subpatch pin
+              console.log('renaming '+that.IOBoxInputPin().masterPin.pinname+" to "+pinname);
+              that.parentPatch.inputPins[pinname] = that.parentPatch.inputPins[that.IOBoxInputPin().masterPin.pinname];
+              delete that.parentPatch.inputPins[that.IOBoxInputPin().masterPin.pinname];
+              that.IOBoxInputPin().masterPin.pinname = pinname;
+            }
+          }
+          this.IOBoxOutputPin().connectionChanged();
+        }
+      }
+    }
 	
     this.setup = function() 
     {
@@ -319,7 +397,7 @@ VVVV.Core = {
     this.destroy = function() {
       this.fromPin.links.splice(this.fromPin.links.indexOf(this), 1);
       this.toPin.links.splice(this.toPin.links.indexOf(this), 1);
-      this.fromPin.node.patch.linkList.splice(this.fromPin.node.patch.linkList.indexOf(this),1);
+      this.fromPin.node.parentPatch.linkList.splice(this.fromPin.node.parentPatch.linkList.indexOf(this),1);
     }
   },
 
@@ -338,7 +416,7 @@ VVVV.Core = {
     this.error = error_handler;
     
     this.XMLCode = '';
-    this.VVVVConnector = new VVVV.Core.VVVVConnector(this);
+    this.VVVVConnector = undefined;
     
     var print_timing = false;
     
@@ -381,8 +459,8 @@ VVVV.Core = {
     var thisPatch = this;
     
     this.doLoad = function(xml) {
-      
-      var version_match = /^<!DOCTYPE\s+PATCH\s+SYSTEM\s+"(.+\\)*(.+)\.dtd/.exec(xml);
+      this.dirty = true;
+      var version_match = /^<!DOCTYPE\s+PATCH\s+SYSTEM\s+"(.+)\\(.+)\.dtd/.exec(xml);
       if (version_match)
         thisPatch.vvvv_version = version_match[2].replace(/[a-zA-Z]+/, '_');
       
@@ -406,13 +484,15 @@ VVVV.Core = {
       
       if (syncmode=='complete')
         newNodes = {};
+        
+      var nodesLoading = 0;
 
       $(xml).find('node').each(function() {
         
         // in case of renaming a node, delete the old one first
         if ($(this).attr('createme')=='pronto' && thisPatch.nodeMap[$(this).attr('id')]!=undefined) {
           var n = thisPatch.nodeMap[$(this).attr('id')];
-          if (VVVV_ENV=='development') console.log("node renamed, so deleting node "+n.nodename);
+          if (VVVV_ENV=='development') console.log("node renamed, so deleting node "+n.id+' / '+n.nodename);
           
           _(n.inputPins).each(function(p) {
             _(p.links).each(function (link) {
@@ -472,16 +552,47 @@ VVVV.Core = {
             n.nodename = nodename;
           }
           else {
-            var n = new VVVV.Core.Node($(this).attr('id'), nodename, thisPatch);
-            n.not_implemented = true;
-            if (syncmode=='diff' && VVVV.Config.auto_undo == true)
-              thisPatch.VVVVConnector.sendUndo();
-            VVVV.onNotImplemented(nodename); 
+            if (/.v4p$/.test($(this).attr('filename'))) {
+              thisPatch.pause = true;
+              nodesLoading++;
+              var n = new VVVV.Core.Patch($(this).attr('filename'),
+                function() {
+                  thisPatch.pause = false;
+                  nodesLoading--;
+                  console.log(n.nodename+'invoking updade links')
+                  updateLinks(xml);
+                  if (thisPatch.VVVVConnector)
+                    thisPatch.VVVVConnector.addPatch(n);
+                  if (n.auto_evaluate)
+                    this.auto_evaluate = true;
+                  thisPatch.afterUpdate();
+                },
+                function() {
+                  n.not_implemented = true;
+                  VVVV.onNotImplemented(nodename);
+                }
+              );
+              n.setupObject();
+              n.isSubpatch = true;
+              n.parentPatch = thisPatch;
+              n.id = $(this).attr('id');
+              thisPatch.nodeMap[n.id] = n;
+            }
+            else {
+              var n = new VVVV.Core.Node($(this).attr('id'), nodename, thisPatch);
+              n.not_implemented = true;
+              if (syncmode=='diff' && VVVV.Config.auto_undo == true)
+                thisPatch.VVVVConnector.sendUndo();
+              VVVV.onNotImplemented(nodename);
+            }
           }
           if (VVVV_ENV=='development') console.log('inserted new node '+n.nodename);
         }
         else
           n = thisPatch.nodeMap[$(this).attr('id')];
+          
+        if (n.auto_evaluate) // as soon as the patch contains a single auto-evaluate node, it is also an auto evaluating subpatch
+          thisPatch.auto_evaluate = true;
           
         if ($(this).attr('deleteme')=='pronto') {
           if (VVVV_ENV=='development') console.log('removing node '+n.id);
@@ -595,88 +706,104 @@ VVVV.Core = {
         });
       }
     
-      if (syncmode=='complete')
-        newLinks = {};
-      
-      // first delete marked links 
-      $(xml).find('link[deleteme="pronto"]').each(function() {
-        var link = false;
-        for (var i=0; i<thisPatch.linkList.length; i++) {
-          if (thisPatch.linkList[i].fromPin.node.id==$(this).attr('srcnodeid') &&
-              thisPatch.linkList[i].fromPin.pinname==$(this).attr('srcpinname') &&
-              thisPatch.linkList[i].toPin.node.id==$(this).attr('dstnodeid') &&
-              thisPatch.linkList[i].toPin.pinname==$(this).attr('dstpinname')) {
-            link = thisPatch.linkList[i];
-          }
-        }
-        if (VVVV_ENV=='development') console.log('removing '+link.fromPin.pinname+' -> '+link.toPin.pinname);
-        var fromPin = link.fromPin;
-        var toPin = link.toPin;
-        link.destroy();
-        fromPin.connectionChanged();
-        toPin.connectionChanged();
-        toPin.markPinAsChanged();
-        if (toPin.reset_on_disconnect)
-          toPin.reset();
-      });
-      
-      $(xml).find('link[deleteme!="pronto"]').each(function() {
-        var srcPin = thisPatch.pinMap[$(this).attr('srcnodeid')+'_'+$(this).attr('srcpinname')];
-        var dstPin = thisPatch.pinMap[$(this).attr('dstnodeid')+'_'+$(this).attr('dstpinname')];
+      if (nodesLoading===0)
+        updateLinks(xml);
         
-				// add pins which are neither defined in the node, nor defined in the xml, but only appeare in the links (this is the case with shaders)
-        if (srcPin==undefined && thisPatch.nodeMap[$(this).attr('srcnodeid')])
-          srcPin = thisPatch.nodeMap[$(this).attr('srcnodeid')].addOutputPin($(this).attr('srcpinname'), undefined);
-        if (dstPin==undefined && thisPatch.nodeMap[$(this).attr('dstnodeid')])
-          dstPin = thisPatch.nodeMap[$(this).attr('dstnodeid')].addInputPin($(this).attr('dstpinname'), undefined);
-          
-        if (srcPin && dstPin) {
+      function updateLinks(xml) {
+        if (syncmode=='complete')
+          newLinks = {};
+        
+        // first delete marked links 
+        $(xml).find('link[deleteme="pronto"]').each(function() {
           var link = false;
           for (var i=0; i<thisPatch.linkList.length; i++) {
-            if (thisPatch.linkList[i].fromPin.node.id==srcPin.node.id &&
-  					    thisPatch.linkList[i].fromPin.pinname==srcPin.pinname &&
-  							thisPatch.linkList[i].toPin.node.id==dstPin.node.id &&
-  							thisPatch.linkList[i].toPin.pinname==dstPin.pinname) {
+            if (thisPatch.linkList[i].fromPin.node.id==$(this).attr('srcnodeid') &&
+                thisPatch.linkList[i].fromPin.pinname==$(this).attr('srcpinname') &&
+                thisPatch.linkList[i].toPin.node.id==$(this).attr('dstnodeid') &&
+                thisPatch.linkList[i].toPin.pinname==$(this).attr('dstpinname')) {
               link = thisPatch.linkList[i];
-  					}
-          }
-  
-          if (!link) {
-            link = new VVVV.Core.Link(srcPin, dstPin);
-            srcPin.connectionChanged();
-            dstPin.connectionChanged();
-            thisPatch.linkList.push(link);
-            for (var i=0; i<srcPin.values.length; i++) {
-              dstPin.setValue(i, srcPin.getValue(i));
             }
-            dstPin.setSliceCount(srcPin.getSliceCount());
           }
+          if (VVVV_ENV=='development') console.log('removing '+link.fromPin.pinname+' -> '+link.toPin.pinname);
+          var fromPin = link.fromPin;
+          var toPin = link.toPin;
+          link.destroy();
+          fromPin.connectionChanged();
+          toPin.connectionChanged();
+          toPin.markPinAsChanged();
+          if (toPin.reset_on_disconnect)
+            toPin.reset();
+        });
+        
+        $(xml).find('link[deleteme!="pronto"]').each(function() {
+          var srcPin = thisPatch.pinMap[$(this).attr('srcnodeid')+'_'+$(this).attr('srcpinname')];
+          var dstPin = thisPatch.pinMap[$(this).attr('dstnodeid')+'_'+$(this).attr('dstpinname')];
+          
+  				// add pins which are neither defined in the node, nor defined in the xml, but only appeare in the links (this is the case with shaders)
+          if (srcPin==undefined && thisPatch.nodeMap[$(this).attr('srcnodeid')])
+            srcPin = thisPatch.nodeMap[$(this).attr('srcnodeid')].addOutputPin($(this).attr('srcpinname'), undefined);
+          if (dstPin==undefined && thisPatch.nodeMap[$(this).attr('dstnodeid')])
+            dstPin = thisPatch.nodeMap[$(this).attr('dstnodeid')].addInputPin($(this).attr('dstpinname'), undefined);
             
-          if (syncmode=='complete')
-            newLinks[srcPin.node.id+'_'+srcPin.pinname+'-'+dstPin.node.id+'_'+dstPin.pinname] = link;
-        }
-      });
-      
-      if (syncmode=='complete') {
-        _(oldLinks).each(function(l, key) {
-          if (newLinks[key]==undefined) {
-            if (VVVV_ENV=='development') console.log('removing '+l.fromPin.pinname+' -> '+l.toPin.pinname);
-            var fromPin = l.fromPin;
-            var toPin = l.toPin;
-            l.destroy();
-            fromPin.connectionChanged();
-            toPin.connectionChanged();
-            toPin.markPinAsChanged();
-            if (toPin.reset_on_disconnect)
-              toPin.reset();
+          if (srcPin && dstPin) {
+            var link = false;
+            for (var i=0; i<thisPatch.linkList.length; i++) {
+              if (thisPatch.linkList[i].fromPin.node.id==srcPin.node.id &&
+    					    thisPatch.linkList[i].fromPin.pinname==srcPin.pinname &&
+    							thisPatch.linkList[i].toPin.node.id==dstPin.node.id &&
+    							thisPatch.linkList[i].toPin.pinname==dstPin.pinname) {
+                link = thisPatch.linkList[i];
+    					}
+            }
+    
+            if (!link) {
+              link = new VVVV.Core.Link(srcPin, dstPin);
+              srcPin.connectionChanged();
+              dstPin.connectionChanged();
+              thisPatch.linkList.push(link);
+              for (var i=0; i<srcPin.values.length; i++) {
+                dstPin.setValue(i, srcPin.getValue(i));
+              }
+              dstPin.setSliceCount(srcPin.getSliceCount());
+            }
+              
+            if (syncmode=='complete')
+              newLinks[srcPin.node.id+'_'+srcPin.pinname+'-'+dstPin.node.id+'_'+dstPin.pinname] = link;
           }
         });
-        oldLinks = {};
-        _(newLinks).each(function(l, key) {
-          oldLinks[key] = l;
-        });
+        
+        if (syncmode=='complete') {
+          _(oldLinks).each(function(l, key) {
+            if (newLinks[key]==undefined) {
+              if (VVVV_ENV=='development') console.log('removing '+l.fromPin.pinname+' -> '+l.toPin.pinname);
+              var fromPin = l.fromPin;
+              var toPin = l.toPin;
+              l.destroy();
+              fromPin.connectionChanged();
+              toPin.connectionChanged();
+              toPin.markPinAsChanged();
+              if (toPin.reset_on_disconnect)
+                toPin.reset();
+            }
+          });
+          oldLinks = {};
+          _(newLinks).each(function(l, key) {
+            oldLinks[key] = l;
+          });
+        }
       }
       
+    }
+    
+    this.getSubPatches = function() {
+      var ret = [];
+      for (var i=0; i<this.nodeList.length; i++) {
+        if (this.nodeList[i].isSubpatch) {
+          ret.push(this.nodeList[i]);
+          ret.concat(this.nodeList[i].getSubPatches());
+        }
+      }
+      return ret;
     }
     
     
@@ -707,7 +834,6 @@ VVVV.Core = {
       
       function evaluateSubGraph(node) {
         //console.log("starting with "+node.nodename+" ("+node.id+")");
-
         upstreamNodes = node.getUpstreamNodes();
         _(upstreamNodes).each(function(upnode) {
           if (invalidNodes[upnode.id]!=undefined && !upnode.delays_output) {
@@ -757,6 +883,7 @@ VVVV.Core = {
     // actually load the patch, depending on the type of resource
     
     if (/\.v4p[^<>\s]*$/.test(ressource)) {
+      this.nodename = ressource;
       var that = this;
       $.ajax({
         url: ressource,
@@ -772,8 +899,8 @@ VVVV.Core = {
     }
     else if (/^ws:\/\//.test(ressource)) {
       var that = this;
-      this.VVVVConnector.host = ressource;
-      this.VVVVConnector.enable({
+      VVVV.Editors["Connector"].host = ressource;
+      VVVV.Editors["Connector"].enable(this, {
         success: function() {
           if (that.success) that.success();
         },
@@ -791,10 +918,11 @@ VVVV.Core = {
     // bind the #-shortcuts
     
     function checkLocationHash() {
-      if (!thisPatch.VVVVConnector.isConnected() && (window.location.hash=='#sync/'+thisPatch.ressource || window.location.hash=='#syncandview/'+thisPatch.ressource)) {
+      if (!VVVV.Editors["Connector"].isConnected() && (window.location.hash=='#sync/'+thisPatch.ressource || window.location.hash=='#syncandview/'+thisPatch.ressource)) {
         console.log('enabling devel env');
-        thisPatch.VVVVConnector.host = 'ws://localhost';
-        thisPatch.VVVVConnector.enable();
+        VVVV.Editors["Connector"].disable();
+        VVVV.Editors["Connector"].host = 'ws://localhost';
+        VVVV.Editors["Connector"].enable(thisPatch);
       }
       if (!thisPatch.vvvviewer && (window.location.hash=='#view/'+thisPatch.ressource || window.location.hash=='#syncandview/'+thisPatch.ressource)) {
         thisPatch.vvvviewer = new VVVV.VVVViewer(thisPatch);
@@ -811,3 +939,4 @@ VVVV.Core = {
   
   
 }
+VVVV.Core.Patch.prototype = new VVVV.Core.Node();
